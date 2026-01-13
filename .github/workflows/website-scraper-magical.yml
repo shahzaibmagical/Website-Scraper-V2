@@ -22,6 +22,7 @@ on:
       drive_link:
         description: "Google Drive link to a file or folder containing the input list(s)"
         required: true
+        type: string
 
       write_xlsx:
         description: "Also emit XLSX next to output CSV"
@@ -35,6 +36,7 @@ on:
       max_pages:
         description: "Max pages to crawl per website"
         required: false
+        type: string
         default: "12"
 
       use_sitemap:
@@ -58,52 +60,62 @@ on:
       timeout:
         description: "Requests timeout seconds"
         required: false
+        type: string
         default: "12"
 
       playwright_timeout_ms:
         description: "Playwright timeout (ms)"
         required: false
+        type: string
         default: "25000"
 
       min_text:
         description: "If extracted text is smaller, use Playwright fallback"
         required: false
+        type: string
         default: "900"
 
       max_chars_full:
         description: "Max chars stored in full text column"
         required: false
+        type: string
         default: "250000"
 
       preview_chars:
         description: "Chars stored in preview column"
         required: false
+        type: string
         default: "8000"
 
       per_page_delay:
         description: "Delay between page fetches (seconds)"
         required: false
+        type: string
         default: "0.6"
 
       save_every:
         description: "Save output every N processed rows"
         required: false
+        type: string
         default: "10"
 
-site_workers:
-  description: "Concurrent website workers (faster for large lists)"
-  required: false
-  default: "20"
+      site_workers:
+        description: "Concurrent website workers (faster for large lists)"
+        required: false
+        type: string
+        default: "20"
 
-playwright_workers:
-  description: "Max concurrent Playwright sessions (JS-heavy sites)"
-  required: false
-  default: "2"
+      playwright_workers:
+        description: "Max concurrent Playwright sessions (JS-heavy sites)"
+        required: false
+        type: string
+        default: "2"
 
-site_time_budget_sec:
-  description: "Hard time budget per site (seconds). Stops deep crawling when exceeded."
-  required: false
-  default: "45"
+      site_time_budget_sec:
+        description: "Hard time budget per site (seconds). Stops deep crawling when exceeded."
+        required: false
+        type: string
+        default: "45"
 
 concurrency:
   group: website-scraper-magical-${{ github.run_id }}-${{ github.run_attempt }}
@@ -212,7 +224,6 @@ jobs:
 
           echo "Progress updates will appear as ::notice annotations in logs."
 
-          # If anything throws, write a friendly artifact with the exit code
           trap 'code=$?; echo "Pipeline failed. Exit=$code" > artifacts/runner_error.txt; exit $code' ERR
 
           extra=""
