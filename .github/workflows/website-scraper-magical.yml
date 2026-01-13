@@ -1,0 +1,258 @@
+name: Website Scraper → Scrape Websites (magical)
+
+# GitHub Actions automation for the Magical Website Scraper.
+#
+# - Accepts a Google Drive link (file or folder)
+# - Downloads the referenced file(s)
+# - Scrapes each website listed
+# - Produces output CSV (and optional XLSX) + logs + run summary
+# - Uploads everything as a GitHub Actions artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_os:
+        description: "Select runner OS (Linux recommended for Playwright)"
+        required: false
+        type: choice
+        default: ubuntu-latest
+        options:
+          - ubuntu-latest
+
+      drive_link:
+        description: "Google Drive link to a file or folder containing the input list(s)"
+        required: true
+
+      write_xlsx:
+        description: "Also emit XLSX next to output CSV"
+        required: false
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
+
+      max_pages:
+        description: "Max pages to crawl per website"
+        required: false
+        default: "12"
+
+      use_sitemap:
+        description: "Use sitemap hints (optional)"
+        required: false
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
+
+      headless:
+        description: "Run Playwright headless"
+        required: false
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
+
+      timeout:
+        description: "Requests timeout seconds"
+        required: false
+        default: "12"
+
+      playwright_timeout_ms:
+        description: "Playwright timeout (ms)"
+        required: false
+        default: "25000"
+
+      min_text:
+        description: "If extracted text is smaller, use Playwright fallback"
+        required: false
+        default: "900"
+
+      max_chars_full:
+        description: "Max chars stored in full text column"
+        required: false
+        default: "250000"
+
+      preview_chars:
+        description: "Chars stored in preview column"
+        required: false
+        default: "8000"
+
+      per_page_delay:
+        description: "Delay between page fetches (seconds)"
+        required: false
+        default: "0.6"
+
+      save_every:
+        description: "Save output every N processed rows"
+        required: false
+        default: "10"
+
+site_workers:
+  description: "Concurrent website workers (faster for large lists)"
+  required: false
+  default: "20"
+
+playwright_workers:
+  description: "Max concurrent Playwright sessions (JS-heavy sites)"
+  required: false
+  default: "2"
+
+site_time_budget_sec:
+  description: "Hard time budget per site (seconds). Stops deep crawling when exceeded."
+  required: false
+  default: "45"
+
+concurrency:
+  group: website-scraper-magical-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ${{ github.event.inputs.runner_os || 'ubuntu-latest' }}
+    timeout-minutes: 360
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      DRIVE_LINK: ${{ github.event.inputs.drive_link }}
+      WRITE_XLSX: ${{ github.event.inputs.write_xlsx || 'true' }}
+      MAX_PAGES: ${{ github.event.inputs.max_pages || '12' }}
+      USE_SITEMAP: ${{ github.event.inputs.use_sitemap || 'false' }}
+      HEADLESS: ${{ github.event.inputs.headless || 'true' }}
+      TIMEOUT: ${{ github.event.inputs.timeout || '12' }}
+      PLAYWRIGHT_TIMEOUT_MS: ${{ github.event.inputs.playwright_timeout_ms || '25000' }}
+      MIN_TEXT: ${{ github.event.inputs.min_text || '900' }}
+      MAX_CHARS_FULL: ${{ github.event.inputs.max_chars_full || '250000' }}
+      PREVIEW_CHARS: ${{ github.event.inputs.preview_chars || '8000' }}
+      PER_PAGE_DELAY: ${{ github.event.inputs.per_page_delay || '0.6' }}
+      SAVE_EVERY: ${{ github.event.inputs.save_every || '10' }}
+      SITE_WORKERS: ${{ github.event.inputs.site_workers || '20' }}
+      PLAYWRIGHT_WORKERS: ${{ github.event.inputs.playwright_workers || '2' }}
+      SITE_TIME_BUDGET_SEC: ${{ github.event.inputs.site_time_budget_sec || '45' }}
+
+      # Provide ONE of these secrets (recommended):
+      # - GDRIVE_SERVICE_ACCOUNT_JSON (raw JSON)
+      # - GDRIVE_SERVICE_ACCOUNT_B64 (base64 JSON)
+      GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+      GDRIVE_SERVICE_ACCOUNT_B64: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_B64 }}
+
+      CI: "true"
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bootstrap artifacts folder
+        run: |
+          mkdir -p artifacts
+          echo "bootstrapped at $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > artifacts/_bootstrap.txt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright (Chromium)
+        run: |
+          set -euo pipefail
+          python -m playwright install chromium --with-deps
+
+      - name: Run scraper pipeline
+        run: |
+          set -Eeuo pipefail
+
+          {
+            echo "workflow: $GITHUB_WORKFLOW"
+            echo "event: $GITHUB_EVENT_NAME"
+            echo "runner_os: $RUNNER_OS"
+            echo "run_id: $GITHUB_RUN_ID"
+            echo "run_number: $GITHUB_RUN_NUMBER"
+            echo "attempt: $GITHUB_RUN_ATTEMPT"
+            echo "ref: $GITHUB_REF"
+            echo "sha: $GITHUB_SHA"
+            echo "utc_started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "DRIVE_LINK: ${DRIVE_LINK}"
+            echo "WRITE_XLSX: ${WRITE_XLSX}"
+            echo "MAX_PAGES: ${MAX_PAGES}"
+            echo "USE_SITEMAP: ${USE_SITEMAP}"
+            echo "HEADLESS: ${HEADLESS}"
+            echo "TIMEOUT: ${TIMEOUT}"
+            echo "PLAYWRIGHT_TIMEOUT_MS: ${PLAYWRIGHT_TIMEOUT_MS}"
+            echo "MIN_TEXT: ${MIN_TEXT}"
+            echo "MAX_CHARS_FULL: ${MAX_CHARS_FULL}"
+            echo "PREVIEW_CHARS: ${PREVIEW_CHARS}"
+            echo "PER_PAGE_DELAY: ${PER_PAGE_DELAY}"
+            echo "SAVE_EVERY: ${SAVE_EVERY}"
+            echo "SITE_WORKERS: ${SITE_WORKERS}"
+            echo "PLAYWRIGHT_WORKERS: ${PLAYWRIGHT_WORKERS}"
+            echo "SITE_TIME_BUDGET_SEC: ${SITE_TIME_BUDGET_SEC}"
+          } > artifacts/workflow_meta.txt
+
+          echo "Progress updates will appear as ::notice annotations in logs."
+
+          # If anything throws, write a friendly artifact with the exit code
+          trap 'code=$?; echo "Pipeline failed. Exit=$code" > artifacts/runner_error.txt; exit $code' ERR
+
+          extra=""
+          if [ "${WRITE_XLSX}" = "true" ]; then extra="$extra --write-xlsx"; fi
+          if [ "${USE_SITEMAP}" = "true" ]; then extra="$extra --use-sitemap"; fi
+          if [ "${HEADLESS}" = "false" ]; then extra="$extra --no-headless"; fi
+
+          python -u scripts/run_actions_pipeline.py \
+            --drive-link "${DRIVE_LINK}" \
+            --artifacts-dir "artifacts" \
+            --max-pages "${MAX_PAGES}" \
+            --timeout "${TIMEOUT}" \
+            --playwright-timeout-ms "${PLAYWRIGHT_TIMEOUT_MS}" \
+            --min-text "${MIN_TEXT}" \
+            --max-chars-full "${MAX_CHARS_FULL}" \
+            --preview-chars "${PREVIEW_CHARS}" \
+            --per-page-delay "${PER_PAGE_DELAY}" \
+            --save-every "${SAVE_EVERY}" \
+            --site-workers "${SITE_WORKERS}" \
+            --playwright-workers "${PLAYWRIGHT_WORKERS}" \
+            --site-time-budget-sec "${SITE_TIME_BUDGET_SEC}" \
+            ${extra}
+
+      - name: Publish run summary (always)
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "## Website Scraper Automation Summary" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f artifacts/run_summary.md ]; then
+            cat artifacts/run_summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No run_summary.md produced (pipeline may have failed early)._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload artifacts (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-scraper-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/**
+          if-no-files-found: warn
+          compression-level: 9
+          retention-days: 14
