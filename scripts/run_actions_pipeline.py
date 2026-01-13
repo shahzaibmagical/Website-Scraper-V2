@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Entry-point for the GitHub Actions scraper automation.
+"""Entry-point for the GitHub Actions scraper automation (magical + resilient).
 
-Responsibilities
-- Accept a Google Drive link (file or folder)
-- Download the input file(s) from Drive
-- Run scraper_magical.py on each input file
-- Generate outputs and upload-ready artifacts (CSV/XLSX + logs + summary)
+Fix included:
+- Accepts new CLI args:
+  --site-workers, --playwright-workers, --site-time-budget-sec
+- Passes them through to scraper_magical.py
+- Backward-compatible fallback:
+  If scraper_magical.py does NOT support these args yet, it will automatically retry
+  without them (so the pipeline does not break).
 
-Design goal
-Match the operational standards of the existing "close existing deals" automation:
-- strict/defensive input handling
-- deterministic artifact folder
-- human-readable run summary for Actions UI
-- failures leave behind helpful artifacts
+This matches the reliability style of the close-deals automation:
+- Always produces artifacts + summaries
+- Streams live logs for near-real-time progress
 """
 
 from __future__ import annotations
@@ -43,7 +42,6 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-
 def write_progress_snapshot(path: Path, snapshot: Dict[str, Any]) -> None:
     """Write a small progress file for near-real-time visibility in logs/artifacts."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,6 +60,39 @@ def progress_md(snapshot: Dict[str, Any]) -> str:
         f"- Skipped: {snapshot.get('rows_skipped')}\n"
         f"- Updated (UTC): {snapshot.get('utc_now')}\n"
     )
+
+
+def _run_subprocess_streaming(cmd: List[str], cwd: Path, log_path: Path) -> subprocess.CompletedProcess:
+    """
+    Run a subprocess and stream stdout live to:
+      - GitHub Actions logs (stdout)
+      - per-file log file
+    Returns CompletedProcess-like info (returncode only).
+    """
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        universal_newlines=True,
+    )
+
+    captured_lines: List[str] = []
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write("\n\n--- subprocess live output ---\n")
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                captured_lines.append(line)
+                fh.write(line)
+                fh.flush()
+                print(line.rstrip("\n"), flush=True)
+
+    proc.wait()
+    return subprocess.CompletedProcess(args=cmd, returncode=proc.returncode, stdout="".join(captured_lines), stderr=None)
+
+
 def safe_run_scraper(
     repo_root: Path,
     input_path: Path,
@@ -74,7 +105,7 @@ def safe_run_scraper(
 
     t0 = time.time()
 
-    cmd = [
+    base_cmd = [
         sys.executable,
         str(repo_root / "scraper_magical.py"),
         "--input",
@@ -101,6 +132,11 @@ def safe_run_scraper(
         str(args.per_page_delay),
         "--save-every",
         str(args.save_every),
+    ]
+
+    # New speed/coverage knobs (passed through)
+    # NOTE: We add them here, but we also support a fallback retry if scraper doesn't recognize them.
+    extra_new_args = [
         "--site-workers",
         str(args.site_workers),
         "--playwright-workers",
@@ -110,39 +146,36 @@ def safe_run_scraper(
     ]
 
     if args.use_sitemap:
-        cmd.append("--use-sitemap")
+        base_cmd.append("--use-sitemap")
     if args.write_xlsx:
-        cmd.append("--write-xlsx")
+        base_cmd.append("--write-xlsx")
     if args.headless:
-        cmd.append("--headless")
+        base_cmd.append("--headless")
     else:
-        cmd.append("--no-headless")
+        base_cmd.append("--no-headless")
 
-    # Capture stdout/stderr into the per-file log (the scraper already logs to file,
-    # but this catches Python-level tracebacks in CI as well).
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(repo_root),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=1,
-        universal_newlines=True,
-    )
+    # First attempt: with new args (fast/awesome)
+    cmd = base_cmd + extra_new_args
+    result = _run_subprocess_streaming(cmd=cmd, cwd=repo_root, log_path=log_path)
 
-    # Stream output in real time to BOTH GitHub Actions logs and the per-file log.
-    # This enables "kinda realtime" progress stats (the scraper emits progress lines).
-    with open(log_path, "a", encoding="utf-8") as fh:
-        fh.write("\n\n--- subprocess live output ---\n")
-        if proc.stdout is not None:
-            for line in proc.stdout:
-                fh.write(line)
-                fh.flush()
-                print(line.rstrip("\n"), flush=True)
+    # Backward-compatible retry:
+    # If scraper_magical.py is older and doesn't know these flags, retry without them.
+    if result.returncode != 0 and result.stdout:
+        if "unrecognized arguments:" in result.stdout and (
+            "--site-workers" in result.stdout
+            or "--playwright-workers" in result.stdout
+            or "--site-time-budget-sec" in result.stdout
+        ):
+            print(
+                "::warning title=Compatibility Mode::scraper_magical.py does not support "
+                "--site-workers/--playwright-workers/--site-time-budget-sec yet. Retrying without them.",
+                flush=True,
+            )
+            # Retry without new args
+            result = _run_subprocess_streaming(cmd=base_cmd, cwd=repo_root, log_path=log_path)
 
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError(f"scraper_magical.py exited with code {proc.returncode}. See log: {log_path.name}")
+    if result.returncode != 0:
+        raise RuntimeError(f"scraper_magical.py exited with code {result.returncode}. See log: {log_path.name}")
 
     # Summarize output
     df = pd.read_csv(output_csv, low_memory=False)
@@ -187,6 +220,11 @@ def main() -> None:
     ap.add_argument("--per-page-delay", type=float, default=0.6)
     ap.add_argument("--save-every", type=int, default=10)
 
+    # ✅ NEW (fast + awesome)
+    ap.add_argument("--site-workers", type=int, default=20, help="Concurrent website workers (requests-first).")
+    ap.add_argument("--playwright-workers", type=int, default=2, help="Max concurrent Playwright sessions.")
+    ap.add_argument("--site-time-budget-sec", type=int, default=45, help="Hard time budget per site (seconds).")
+
     args = ap.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -223,7 +261,7 @@ def main() -> None:
     per_file: List[Dict[str, Any]] = []
     failures: List[str] = []
 
-    for i, input_path in enumerate(downloaded, start=1):
+    for input_path in downloaded:
         stem = input_path.stem
         out_csv = outputs_dir / f"{stem}__scraped.csv"
         ck = checkpoints_dir / f"{stem}__checkpoint.json"
@@ -239,7 +277,8 @@ def main() -> None:
                 args=args,
             )
             per_file.append(info)
-            # Update aggregated progress snapshot (useful for logs/artifacts during long runs)
+
+            # Update aggregated progress snapshot
             agg_total = sum(int(x.get("rows_total", 0)) for x in per_file)
             agg_done = sum(int(x.get("rows_done", 0)) for x in per_file)
             agg_err = sum(int(x.get("rows_error", 0)) for x in per_file)
@@ -260,7 +299,6 @@ def main() -> None:
             write_progress_snapshot(artifacts / "progress.json", snapshot)
             write_text(artifacts / "progress.md", progress_md(snapshot))
 
-            # Nice UI signal while the job is still running
             print(
                 f"::notice title=Pipeline Progress::files={snapshot['files_completed']}/{snapshot['files_total']} "
                 f"rows_done={snapshot['rows_done']}/{snapshot['rows_total']} pending={snapshot['rows_pending']} "
@@ -270,22 +308,18 @@ def main() -> None:
 
         except Exception as e:
             failures.append(f"{input_path.name}: {e}")
-            # keep going; we still want artifacts for other files
 
     finished = utc_now_iso()
 
-    # If everything failed, treat as pipeline failure (infra / auth / etc.)
     if not per_file:
         err = "All input files failed to process.\n" + "\n".join(failures)
         write_text(artifacts / "runner_error.txt", err)
         raise SystemExit(2)
 
-    # Build summary
     total_rows = sum(int(x.get("rows_total", 0)) for x in per_file)
     total_done = sum(int(x.get("rows_done", 0)) for x in per_file)
     total_error = sum(int(x.get("rows_error", 0)) for x in per_file)
     total_skipped = sum(int(x.get("rows_skipped", 0)) for x in per_file)
-    total_pending = max(0, total_rows - (total_done + total_error + total_skipped))
 
     summary: Dict[str, Any] = {
         "utc_started": started,
@@ -312,13 +346,18 @@ def main() -> None:
             "per_page_delay": args.per_page_delay,
             "save_every": args.save_every,
             "write_xlsx": bool(args.write_xlsx),
-            "has_service_account": bool(os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON") or os.environ.get("GDRIVE_SERVICE_ACCOUNT_B64")),
+            # ✅ NEW knobs
+            "site_workers": args.site_workers,
+            "playwright_workers": args.playwright_workers,
+            "site_time_budget_sec": args.site_time_budget_sec,
+            "has_service_account": bool(
+                os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON") or os.environ.get("GDRIVE_SERVICE_ACCOUNT_B64")
+            ),
         },
     }
 
     (artifacts / "run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    # Human-readable markdown summary for Actions UI
     md = []
     md.append(f"**UTC started:** {started}")
     md.append(f"**UTC finished:** {finished}")
@@ -328,6 +367,11 @@ def main() -> None:
     md.append(f"- Done: **{total_done}**")
     md.append(f"- Error: **{total_error}**")
     md.append(f"- Skipped: **{total_skipped}**")
+    md.append("")
+    md.append("### Config")
+    md.append(f"- site_workers: `{args.site_workers}`")
+    md.append(f"- playwright_workers: `{args.playwright_workers}`")
+    md.append(f"- site_time_budget_sec: `{args.site_time_budget_sec}`")
     md.append("")
     md.append("### Per input file")
     for r in per_file:
